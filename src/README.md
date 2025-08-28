@@ -32,4 +32,4 @@ SmartSuggest/
 
 | Screenshot 1 | Screenshot 2 |
 |--------------|--------------|
-| ![Home Page](assets\Home Page.jpg) | ![Logs](assets\Show log.jpg) |
+| ![Home Page](assets/HomePage.jpg) | ![Logs](assets/Showlog.jpg) |
