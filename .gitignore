@@ -1,12 +1,93 @@
+# ==========================================
+# Built-in Android & Gradle Build Artifacts
+# ==========================================
 *.iml
-.gradle
-/local.properties
-/.idea
-.DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
+.gradle/
+/build/
+/*/build/
+build/
+
+# Local configuration & SDK paths
 local.properties
+/local.properties
+
+# Android profiling, captures, and NDK build artifacts
+/captures/
+.externalNativeBuild/
+.cxx/
+
+# Binary packages & generated executables
 *.apk
+*.ap_
 *.aab
+*.dex
+*.class
+
+# Signing keys & secrets
+*.jks
+*.keystore
+*.key
+*.p12
+*.pem
+google-services.json
+
+# Native compilation artifacts
+*.so
+*.o
+*.obj
+*.dll
+*.dylib
+
+# ==========================================
+# IDE & Editor Specific Files
+# ==========================================
+# Android Studio / IntelliJ IDEA
+.idea/
+*.iws
+*.ipr
+out/
+
+# Visual Studio Code
+.vscode/
+
+# Eclipse
+.project
+.classpath
+.settings/
+bin/
+
+# NetBeans
+/nbproject/
+/nbbuild/
+/dist/
+/nb-build/
+
+# ==========================================
+# Operating System Junk
+# ==========================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+
+# ==========================================
+# Logs & Diagnostic Dumps
+# ==========================================
+*.log
