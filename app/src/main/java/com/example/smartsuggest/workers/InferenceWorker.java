@@ -1,6 +1,6 @@
 package com.example.smartsuggest.workers;
 
-import android.app.usage.UsageStats;
+import android.app.usage.UsageEvents;
 import android.app.usage.UsageStatsManager;
 import android.content.Context;
 
@@ -8,17 +8,17 @@ import androidx.annotation.NonNull;
 import androidx.work.Worker;
 import androidx.work.WorkerParameters;
 
+import com.example.smartsuggest.data.AppDatabase;
+import com.example.smartsuggest.data.InferenceResult;
 import com.example.smartsuggest.model.LSTMModel;
+import com.example.smartsuggest.utils.AppContextEngine;
 import com.example.smartsuggest.utils.ModelFileUtils;
 
 import org.deeplearning4j.nn.multilayer.MultiLayerNetwork;
 import org.nd4j.linalg.api.ndarray.INDArray;
-import org.nd4j.linalg.factory.Nd4j;
 
 import java.util.List;
-import java.util.Map;
-import java.util.SortedMap;
-import java.util.TreeMap;
+import java.util.Locale;
 
 public class InferenceWorker extends Worker {
 
@@ -30,12 +30,15 @@ public class InferenceWorker extends Worker {
     @Override
     public Result doWork() {
 
-        // step 1 - check if foreground app is in rest list
+        // step 1 - check if foreground app is in rest list / launcher
         if (!isForegroundAppInRestList()) {
-            return Result.success(); // skip silently
+            return Result.success(); // skip silently when user is active in an app
         }
 
-        // step 2 - load model (from file if exists, else fresh)
+        // step 2 - discover installed candidate apps
+        List<AppContextEngine.AppItem> installedApps = AppContextEngine.getInstalledCandidateApps(getApplicationContext());
+
+        // step 3 - load model (from file if exists, else fresh)
         MultiLayerNetwork network;
         if (ModelFileUtils.modelExists(getApplicationContext())) {
             network = ModelFileUtils.loadModel(getApplicationContext());
@@ -46,15 +49,33 @@ public class InferenceWorker extends Worker {
 
         if (network == null) return Result.failure();
 
-        // step 3 - run inference
-        // replace this dummy input with your real input data later
-        INDArray input = Nd4j.zeros(1, 10, 1); // shape: [batch, input_size, time_steps]
+        // step 4 - extract real live device context
+        INDArray input = AppContextEngine.extractCurrentContextFeatures(getApplicationContext(), installedApps);
         INDArray output = network.output(input);
 
-        // step 4 - do something with output (log it for now)
-        System.out.println("Inference output: " + output);
+        // step 5 - find top predicted app
+        int bestIndex = 0;
+        double maxProb = -1.0;
+        for (int i = 0; i < installedApps.size(); i++) {
+            double prob = output.getDouble(0, i, 0);
+            if (prob > maxProb) {
+                maxProb = prob;
+                bestIndex = i;
+            }
+        }
+        String topAppName = installedApps.get(bestIndex).label;
 
-        // step 5 - let go of model, GC will reclaim memory
+        // step 6 - save output and input snapshot to Room database
+        AppDatabase db = AppDatabase.getInstance(getApplicationContext());
+        InferenceResult result = new InferenceResult(
+                System.currentTimeMillis(),
+                String.format(Locale.getDefault(), "Top: %s (%.1f%%)", topAppName, maxProb * 100),
+                input.toString()
+        );
+        db.inferenceResultDao().insert(result);
+        db.inferenceResultDao().pruneOld();
+
+        // step 7 - let go of model
         network = null;
 
         return Result.success();
@@ -64,36 +85,44 @@ public class InferenceWorker extends Worker {
         UsageStatsManager usageStatsManager = (UsageStatsManager)
                 getApplicationContext().getSystemService(Context.USAGE_STATS_SERVICE);
 
+        if (usageStatsManager == null) return false;
+
         long currentTime = System.currentTimeMillis();
-        List<UsageStats> stats = usageStatsManager.queryUsageStats(
-                UsageStatsManager.INTERVAL_DAILY,
-                currentTime - 1000 * 10, // last 10 seconds
-                currentTime
-        );
+        long startTime = currentTime - 1000 * 60; // last 60 seconds
 
-        if (stats == null || stats.isEmpty()) return false;
+        UsageEvents events = usageStatsManager.queryEvents(startTime, currentTime);
+        if (events == null) return false;
 
-        // find the most recently used app
-        SortedMap<Long, UsageStats> sortedMap = new TreeMap<>();
-        for (UsageStats usageStats : stats) {
-            sortedMap.put(usageStats.getLastTimeUsed(), usageStats);
+        UsageEvents.Event event = new UsageEvents.Event();
+        String foregroundApp = null;
+
+        while (events.hasNextEvent()) {
+            events.getNextEvent(event);
+            if (event.getEventType() == UsageEvents.Event.ACTIVITY_RESUMED) {
+                foregroundApp = event.getPackageName();
+            }
         }
 
-        String foregroundApp = sortedMap.get(sortedMap.lastKey()).getPackageName();
+        if (foregroundApp == null) return false;
 
-        // define your rest list here
+        // define rest list (common launchers and system home apps)
         return isInRestList(foregroundApp);
     }
 
     private boolean isInRestList(String packageName) {
-        // add apps here where it's safe to run inference
         String[] restList = {
-                "com.android.launcher3",   // home screen
-                "com.google.android.apps.nexuslauncher" // pixel launcher
+                "com.android.launcher3",
+                "com.google.android.apps.nexuslauncher",
+                "com.sec.android.app.launcher",       // Samsung OneUI Launcher
+                "com.miui.home",                       // Xiaomi MIUI / HyperOS Launcher
+                "com.oppo.launcher",                   // Oppo / Realme ColorOS Launcher
+                "com.oneplus.launcher",                // OnePlus Launcher
+                "com.huawei.android.launcher",         // Huawei EMUI Launcher
+                "com.vivo.launcher"                    // Vivo Funtouch Launcher
         };
 
         for (String app : restList) {
-            if (app.equals(packageName)) return true;
+            if (app.equalsIgnoreCase(packageName)) return true;
         }
         return false;
     }

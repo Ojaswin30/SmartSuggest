@@ -7,6 +7,7 @@ import org.deeplearning4j.nn.conf.layers.RnnOutputLayer;
 import org.deeplearning4j.nn.multilayer.MultiLayerNetwork;
 import org.deeplearning4j.nn.weights.WeightInit;
 import org.nd4j.linalg.activations.Activation;
+import org.nd4j.linalg.learning.config.Adam;
 import org.nd4j.linalg.lossfunctions.LossFunctions;
 
 public class LSTMModel {
@@ -21,6 +22,7 @@ public class LSTMModel {
 
     public LSTMModel() {
         MultiLayerConfiguration config = new NeuralNetConfiguration.Builder()
+                .updater(new Adam(LEARNING_RATE))
                 .weightInit(WeightInit.XAVIER)
                 .list()
                 .layer(new LSTM.Builder()
