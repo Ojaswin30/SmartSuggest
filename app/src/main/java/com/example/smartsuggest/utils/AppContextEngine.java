@@ -41,9 +41,6 @@ public class AppContextEngine {
         }
     }
 
-    /**
-     * Dynamically discovers actual user apps installed on the device.
-     */
     public static List<AppItem> getInstalledCandidateApps(Context context) {
         PackageManager pm = context.getPackageManager();
         Intent mainIntent = new Intent(Intent.ACTION_MAIN, null);
@@ -54,6 +51,13 @@ public class AppContextEngine {
         String myPkg = context.getPackageName();
 
         if (resolvedList != null) {
+            // Sort resolved list by package name deterministically
+            Collections.sort(resolvedList, (a, b) -> {
+                String pkgA = (a.activityInfo != null && a.activityInfo.packageName != null) ? a.activityInfo.packageName : "";
+                String pkgB = (b.activityInfo != null && b.activityInfo.packageName != null) ? b.activityInfo.packageName : "";
+                return pkgA.compareTo(pkgB);
+            });
+
             for (ResolveInfo info : resolvedList) {
                 if (info.activityInfo == null) continue;
                 String pkg = info.activityInfo.packageName;
@@ -85,6 +89,14 @@ public class AppContextEngine {
         }
 
         return appList;
+    }
+
+    public static List<String> getPackageNames(List<AppItem> apps) {
+        List<String> names = new ArrayList<>(apps.size());
+        for (AppItem app : apps) {
+            names.add(app.packageName);
+        }
+        return names;
     }
 
     /**
@@ -183,8 +195,10 @@ public class AppContextEngine {
      */
     public static DataSet buildTrainingDataSet(Context context, List<AppItem> candidateApps) {
         UsageStatsManager usm = (UsageStatsManager) context.getSystemService(Context.USAGE_STATS_SERVICE);
+        if (usm == null) return null;
+
         long endTime = System.currentTimeMillis();
-        long startTime = endTime - (1000 * 60 * 60 * 24); // past 24 hours
+        long startTime = endTime - (1000L * 60 * 60 * 24); // past 24 hours
 
         Map<String, Integer> pkgToIndex = new HashMap<>();
         for (int i = 0; i < candidateApps.size(); i++) {
@@ -192,57 +206,60 @@ public class AppContextEngine {
         }
 
         List<Integer> targetIndices = new ArrayList<>();
-        List<Float> targetHours = new ArrayList<>();
+        List<Long> eventTimestamps = new ArrayList<>();
 
-        if (usm != null) {
-            UsageEvents events = usm.queryEvents(startTime, endTime);
-            if (events != null) {
-                UsageEvents.Event event = new UsageEvents.Event();
-                while (events.hasNextEvent()) {
-                    events.getNextEvent(event);
-                    if (event.getEventType() == UsageEvents.Event.ACTIVITY_RESUMED) {
-                        String pkg = event.getPackageName();
-                        if (pkgToIndex.containsKey(pkg)) {
-                            targetIndices.add(pkgToIndex.get(pkg));
-                            Calendar c = Calendar.getInstance();
-                            c.setTimeInMillis(event.getTimeStamp());
-                            targetHours.add((c.get(Calendar.HOUR_OF_DAY) + (c.get(Calendar.MINUTE) / 60.0f)) / 24.0f);
-                        }
+        UsageEvents events = usm.queryEvents(startTime, endTime);
+        if (events != null) {
+            UsageEvents.Event event = new UsageEvents.Event();
+            while (events.hasNextEvent()) {
+                events.getNextEvent(event);
+                if (event.getEventType() == UsageEvents.Event.ACTIVITY_RESUMED) {
+                    String pkg = event.getPackageName();
+                    if (pkgToIndex.containsKey(pkg)) {
+                        targetIndices.add(pkgToIndex.get(pkg));
+                        eventTimestamps.add(event.getTimeStamp());
                     }
                 }
             }
         }
 
-        // If history is small, create synthesized samples grounded in the user's apps
-        int sampleCount = Math.max(5, targetIndices.size());
-        int timeSteps = 5;
+        if (targetIndices.isEmpty()) {
+            return null;
+        }
 
+        int timeSteps = targetIndices.size();
         INDArray input = Nd4j.zeros(1, FEATURE_COUNT, timeSteps);
         INDArray labels = Nd4j.zeros(1, MAX_CANDIDATE_APPS, timeSteps);
 
         for (int t = 0; t < timeSteps; t++) {
-            int targetAppIdx;
-            float hourFeature;
+            int targetAppIdx = targetIndices.get(t);
+            long timestamp = eventTimestamps.get(t);
+            int prevAppIdx = (t > 0) ? targetIndices.get(t - 1) : -1;
 
-            if (t < targetIndices.size()) {
-                targetAppIdx = targetIndices.get(targetIndices.size() - 1 - t);
-                hourFeature = targetHours.get(targetHours.size() - 1 - t);
-            } else {
-                targetAppIdx = t % MAX_CANDIDATE_APPS;
-                hourFeature = (8.0f + (t * 3.0f)) / 24.0f;
-            }
+            Calendar c = Calendar.getInstance();
+            c.setTimeInMillis(timestamp);
+            int hour = c.get(Calendar.HOUR_OF_DAY);
+            int minute = c.get(Calendar.MINUTE);
+            int dayOfWeek = c.get(Calendar.DAY_OF_WEEK);
 
-            // Populate features
+            float hourFeature = (hour + (minute / 60.0f)) / 24.0f;
+            float dayFeature = (dayOfWeek - 1.0f) / 6.0f;
+            float isWeekend = (dayOfWeek == Calendar.SATURDAY || dayOfWeek == Calendar.SUNDAY) ? 1.0f : 0.0f;
+            float prevAppFeature = (prevAppIdx >= 0) ? (prevAppIdx / (float) MAX_CANDIDATE_APPS) : 0.0f;
+            float hasTransition = (prevAppIdx >= 0) ? 1.0f : 0.0f;
+            float nightMode = (hour >= 22 || hour < 6) ? 1.0f : 0.0f;
+
+            // Populate features matching real-time context
             input.putScalar(new int[]{0, 0, t}, hourFeature);
-            input.putScalar(new int[]{0, 1, t}, 0.5f);
-            input.putScalar(new int[]{0, 2, t}, 0.0f);
-            input.putScalar(new int[]{0, 3, t}, 0.8f);
+            input.putScalar(new int[]{0, 1, t}, dayFeature);
+            input.putScalar(new int[]{0, 2, t}, isWeekend);
+            input.putScalar(new int[]{0, 3, t}, 0.5f);
             input.putScalar(new int[]{0, 4, t}, 0.0f);
             input.putScalar(new int[]{0, 5, t}, 0.0f);
             input.putScalar(new int[]{0, 6, t}, 1.0f);
-            input.putScalar(new int[]{0, 7, t}, targetAppIdx / (float) MAX_CANDIDATE_APPS);
-            input.putScalar(new int[]{0, 8, t}, 1.0f);
-            input.putScalar(new int[]{0, 9, t}, 0.0f);
+            input.putScalar(new int[]{0, 7, t}, prevAppFeature);
+            input.putScalar(new int[]{0, 8, t}, hasTransition);
+            input.putScalar(new int[]{0, 9, t}, nightMode);
 
             // Valid one-hot ground truth label for softmax loss
             labels.putScalar(new int[]{0, targetAppIdx, t}, 1.0f);

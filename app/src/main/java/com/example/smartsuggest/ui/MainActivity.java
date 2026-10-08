@@ -137,31 +137,42 @@ public class MainActivity extends AppCompatActivity {
         executor.execute(() -> {
             long startTime = System.currentTimeMillis();
             try {
-                // 1. Discover user's actual installed candidate apps
-                List<AppContextEngine.AppItem> installedApps = AppContextEngine.getInstalledCandidateApps(getApplicationContext());
-
-                // 2. Load or initialize neural network
                 MultiLayerNetwork network;
-                if (ModelFileUtils.modelExists(getApplicationContext())) {
-                    network = ModelFileUtils.loadModel(getApplicationContext());
-                } else {
-                    LSTMModel freshModel = new LSTMModel();
-                    network = freshModel.getNetwork();
+                List<AppContextEngine.AppItem> installedApps;
+                INDArray inputContext;
+                INDArray output;
+
+                synchronized (ModelFileUtils.MODEL_LOCK) {
+                    // 1. Discover user's actual installed candidate apps
+                    installedApps = AppContextEngine.getInstalledCandidateApps(getApplicationContext());
+                    List<String> currentPkgs = AppContextEngine.getPackageNames(installedApps);
+
+                    // 2. Load or initialize neural network
+                    if (ModelFileUtils.isModelValid(getApplicationContext(), currentPkgs)) {
+                        network = ModelFileUtils.loadModel(getApplicationContext());
+                    } else {
+                        if (ModelFileUtils.modelExists(getApplicationContext())) {
+                            ModelFileUtils.invalidateModel(getApplicationContext());
+                        }
+                        LSTMModel freshModel = new LSTMModel();
+                        network = freshModel.getNetwork();
+                    }
+
+                    if (network == null) {
+                        runOnUiThread(() -> {
+                            resultText.setText("❌ Error: Failed to load or initialize LSTM model.");
+                            setButtonsEnabled(true);
+                        });
+                        return;
+                    }
+
+                    // 3. Extract real-time context features (time, day, battery, last app, media state)
+                    inputContext = AppContextEngine.extractCurrentContextFeatures(getApplicationContext(), installedApps);
+
+                    // 4. Run LSTM forward pass
+                    output = network.output(inputContext);
                 }
 
-                if (network == null) {
-                    runOnUiThread(() -> {
-                        resultText.setText("❌ Error: Failed to load or initialize LSTM model.");
-                        setButtonsEnabled(true);
-                    });
-                    return;
-                }
-
-                // 3. Extract real-time context features (time, day, battery, last app, media state)
-                INDArray inputContext = AppContextEngine.extractCurrentContextFeatures(getApplicationContext(), installedApps);
-
-                // 4. Run LSTM forward pass
-                INDArray output = network.output(inputContext);
                 long latency = System.currentTimeMillis() - startTime;
 
                 // 5. Map output probabilities to actual installed apps
@@ -227,35 +238,53 @@ public class MainActivity extends AppCompatActivity {
         executor.execute(() -> {
             long startTime = System.currentTimeMillis();
             try {
-                List<AppContextEngine.AppItem> installedApps = AppContextEngine.getInstalledCandidateApps(getApplicationContext());
-
-                MultiLayerNetwork network;
-                if (ModelFileUtils.modelExists(getApplicationContext())) {
-                    network = ModelFileUtils.loadModel(getApplicationContext());
-                } else {
-                    LSTMModel freshModel = new LSTMModel();
-                    network = freshModel.getNetwork();
-                }
-
-                if (network == null) {
-                    runOnUiThread(() -> {
-                        resultText.setText("❌ Error: Failed to load network for retraining.");
-                        setButtonsEnabled(true);
-                    });
-                    return;
-                }
-
-                // Extract actual app usage transitions and context features from the device
-                DataSet realDataSet = AppContextEngine.buildTrainingDataSet(getApplicationContext(), installedApps);
-
                 int epochs = 10;
-                for (int i = 0; i < epochs; i++) {
-                    network.fit(realDataSet);
+                int sampleCount = 0;
+
+                synchronized (ModelFileUtils.MODEL_LOCK) {
+                    List<AppContextEngine.AppItem> installedApps = AppContextEngine.getInstalledCandidateApps(getApplicationContext());
+                    List<String> currentPkgs = AppContextEngine.getPackageNames(installedApps);
+
+                    MultiLayerNetwork network;
+                    if (ModelFileUtils.isModelValid(getApplicationContext(), currentPkgs)) {
+                        network = ModelFileUtils.loadModel(getApplicationContext());
+                    } else {
+                        if (ModelFileUtils.modelExists(getApplicationContext())) {
+                            ModelFileUtils.invalidateModel(getApplicationContext());
+                        }
+                        LSTMModel freshModel = new LSTMModel();
+                        network = freshModel.getNetwork();
+                    }
+
+                    if (network == null) {
+                        runOnUiThread(() -> {
+                            resultText.setText("❌ Error: Failed to load network for retraining.");
+                            setButtonsEnabled(true);
+                        });
+                        return;
+                    }
+
+                    // Extract actual app usage transitions and context features from the device
+                    DataSet realDataSet = AppContextEngine.buildTrainingDataSet(getApplicationContext(), installedApps);
+
+                    if (realDataSet != null && realDataSet.getFeatures() != null) {
+                        sampleCount = (int) realDataSet.getFeatures().size(2);
+                        for (int i = 0; i < epochs; i++) {
+                            network.fit(realDataSet);
+                        }
+                        ModelFileUtils.saveModel(getApplicationContext(), network, currentPkgs);
+                    } else {
+                        runOnUiThread(() -> {
+                            resultText.setText("⚠️ Not enough usage data in past 24h to retrain model.");
+                            setButtonsEnabled(true);
+                        });
+                        return;
+                    }
                 }
 
-                ModelFileUtils.saveModel(getApplicationContext(), network);
                 long duration = System.currentTimeMillis() - startTime;
                 String timeStr = new SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(new Date());
+                final int finalSampleCount = sampleCount;
 
                 runOnUiThread(() -> {
                     String log = String.format(
@@ -263,12 +292,14 @@ public class MainActivity extends AppCompatActivity {
                             "[%s] ON-DEVICE TRAINING COMPLETED\n" +
                             "------------------------------------\n" +
                             "• Mode: Trained on your real device usage\n" +
+                            "• Usage Steps Trained: %d\n" +
                             "• Epochs Trained: %d\n" +
                             "• Duration: %d ms\n" +
                             "• Model Status: Weights saved locally\n" +
                             "• Tip: Tap 'Run Inference' to see personalized rankings!\n" +
                             "------------------------------------",
                             timeStr,
+                            finalSampleCount,
                             epochs,
                             duration
                     );

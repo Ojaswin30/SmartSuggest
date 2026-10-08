@@ -24,36 +24,43 @@ public class RetrainingWorker extends Worker {
     @NonNull
     @Override
     public Result doWork() {
+        synchronized (ModelFileUtils.MODEL_LOCK) {
+            // step 1 - discover installed apps
+            List<AppContextEngine.AppItem> installedApps = AppContextEngine.getInstalledCandidateApps(getApplicationContext());
+            List<String> currentPkgs = AppContextEngine.getPackageNames(installedApps);
 
-        // step 1 - discover installed apps
-        List<AppContextEngine.AppItem> installedApps = AppContextEngine.getInstalledCandidateApps(getApplicationContext());
+            // step 2 - load existing model or create fresh
+            MultiLayerNetwork network;
+            if (ModelFileUtils.isModelValid(getApplicationContext(), currentPkgs)) {
+                network = ModelFileUtils.loadModel(getApplicationContext());
+            } else {
+                if (ModelFileUtils.modelExists(getApplicationContext())) {
+                    ModelFileUtils.invalidateModel(getApplicationContext());
+                }
+                LSTMModel freshModel = new LSTMModel();
+                network = freshModel.getNetwork();
+            }
 
-        // step 2 - load existing model or create fresh
-        MultiLayerNetwork network;
-        if (ModelFileUtils.modelExists(getApplicationContext())) {
-            network = ModelFileUtils.loadModel(getApplicationContext());
-        } else {
-            LSTMModel freshModel = new LSTMModel();
-            network = freshModel.getNetwork();
+            if (network == null) return Result.failure();
+
+            // step 3 - construct training dataset from real 24h usage events
+            DataSet realDataSet = AppContextEngine.buildTrainingDataSet(getApplicationContext(), installedApps);
+
+            if (realDataSet != null && realDataSet.getFeatures() != null) {
+                // step 4 - retrain on device
+                int epochs = 10;
+                for (int i = 0; i < epochs; i++) {
+                    network.fit(realDataSet);
+                }
+
+                // step 5 - save updated weights and mapping
+                ModelFileUtils.saveModel(getApplicationContext(), network, currentPkgs);
+            }
+
+            // step 6 - release memory
+            network = null;
+
+            return Result.success();
         }
-
-        if (network == null) return Result.failure();
-
-        // step 3 - construct training dataset from real 24h usage events
-        DataSet realDataSet = AppContextEngine.buildTrainingDataSet(getApplicationContext(), installedApps);
-
-        // step 4 - retrain on device
-        int epochs = 10;
-        for (int i = 0; i < epochs; i++) {
-            network.fit(realDataSet);
-        }
-
-        // step 5 - save updated weights
-        ModelFileUtils.saveModel(getApplicationContext(), network);
-
-        // step 6 - release memory
-        network = null;
-
-        return Result.success();
     }
 }

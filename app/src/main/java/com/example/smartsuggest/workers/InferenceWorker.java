@@ -3,6 +3,9 @@ package com.example.smartsuggest.workers;
 import android.app.usage.UsageEvents;
 import android.app.usage.UsageStatsManager;
 import android.content.Context;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 
 import androidx.annotation.NonNull;
 import androidx.work.Worker;
@@ -35,25 +38,38 @@ public class InferenceWorker extends Worker {
             return Result.success(); // skip silently when user is active in an app
         }
 
-        // step 2 - discover installed candidate apps
-        List<AppContextEngine.AppItem> installedApps = AppContextEngine.getInstalledCandidateApps(getApplicationContext());
-
-        // step 3 - load model (from file if exists, else fresh)
         MultiLayerNetwork network;
-        if (ModelFileUtils.modelExists(getApplicationContext())) {
-            network = ModelFileUtils.loadModel(getApplicationContext());
-        } else {
-            LSTMModel freshModel = new LSTMModel();
-            network = freshModel.getNetwork();
+        List<AppContextEngine.AppItem> installedApps;
+        INDArray input;
+        INDArray output;
+
+        synchronized (ModelFileUtils.MODEL_LOCK) {
+            // step 2 - discover installed candidate apps
+            installedApps = AppContextEngine.getInstalledCandidateApps(getApplicationContext());
+            List<String> currentPkgs = AppContextEngine.getPackageNames(installedApps);
+
+            // step 3 - load model (from file if valid, else fresh)
+            if (ModelFileUtils.isModelValid(getApplicationContext(), currentPkgs)) {
+                network = ModelFileUtils.loadModel(getApplicationContext());
+            } else {
+                if (ModelFileUtils.modelExists(getApplicationContext())) {
+                    ModelFileUtils.invalidateModel(getApplicationContext());
+                }
+                LSTMModel freshModel = new LSTMModel();
+                network = freshModel.getNetwork();
+            }
+
+            if (network == null) return Result.failure();
+
+            // step 4 - extract real live device context
+            input = AppContextEngine.extractCurrentContextFeatures(getApplicationContext(), installedApps);
+            output = network.output(input);
+
+            // step 5 - release model reference
+            network = null;
         }
 
-        if (network == null) return Result.failure();
-
-        // step 4 - extract real live device context
-        INDArray input = AppContextEngine.extractCurrentContextFeatures(getApplicationContext(), installedApps);
-        INDArray output = network.output(input);
-
-        // step 5 - find top predicted app
+        // step 6 - find top predicted app
         int bestIndex = 0;
         double maxProb = -1.0;
         for (int i = 0; i < installedApps.size(); i++) {
@@ -65,7 +81,7 @@ public class InferenceWorker extends Worker {
         }
         String topAppName = installedApps.get(bestIndex).label;
 
-        // step 6 - save output and input snapshot to Room database
+        // step 7 - save output and input snapshot to Room database
         AppDatabase db = AppDatabase.getInstance(getApplicationContext());
         InferenceResult result = new InferenceResult(
                 System.currentTimeMillis(),
@@ -74,9 +90,6 @@ public class InferenceWorker extends Worker {
         );
         db.inferenceResultDao().insert(result);
         db.inferenceResultDao().pruneOld();
-
-        // step 7 - let go of model
-        network = null;
 
         return Result.success();
     }
@@ -88,7 +101,7 @@ public class InferenceWorker extends Worker {
         if (usageStatsManager == null) return false;
 
         long currentTime = System.currentTimeMillis();
-        long startTime = currentTime - 1000 * 60; // last 60 seconds
+        long startTime = currentTime - (1000L * 60 * 60 * 4); // search last 4 hours
 
         UsageEvents events = usageStatsManager.queryEvents(startTime, currentTime);
         if (events == null) return false;
@@ -110,6 +123,20 @@ public class InferenceWorker extends Worker {
     }
 
     private boolean isInRestList(String packageName) {
+        if (packageName == null) return false;
+        try {
+            Intent homeIntent = new Intent(Intent.ACTION_MAIN);
+            homeIntent.addCategory(Intent.CATEGORY_HOME);
+            ResolveInfo defaultLauncher = getApplicationContext().getPackageManager()
+                    .resolveActivity(homeIntent, PackageManager.MATCH_DEFAULT_ONLY);
+            if (defaultLauncher != null && defaultLauncher.activityInfo != null) {
+                if (packageName.equalsIgnoreCase(defaultLauncher.activityInfo.packageName)) {
+                    return true;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
         String[] restList = {
                 "com.android.launcher3",
                 "com.google.android.apps.nexuslauncher",
