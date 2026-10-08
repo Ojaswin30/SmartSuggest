@@ -1,14 +1,12 @@
 package com.example.smartsuggest.utils;
 
 import android.app.usage.UsageEvents;
+import android.app.usage.UsageStats;
 import android.app.usage.UsageStatsManager;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
-import android.media.AudioManager;
-import android.os.BatteryManager;
 
 import org.nd4j.linalg.api.ndarray.INDArray;
 import org.nd4j.linalg.dataset.DataSet;
@@ -47,17 +45,10 @@ public class AppContextEngine {
         mainIntent.addCategory(Intent.CATEGORY_LAUNCHER);
 
         List<ResolveInfo> resolvedList = pm.queryIntentActivities(mainIntent, 0);
-        List<AppItem> appList = new ArrayList<>();
+        List<AppItem> launchableApps = new ArrayList<>();
         String myPkg = context.getPackageName();
 
         if (resolvedList != null) {
-            // Sort resolved list by package name deterministically
-            Collections.sort(resolvedList, (a, b) -> {
-                String pkgA = (a.activityInfo != null && a.activityInfo.packageName != null) ? a.activityInfo.packageName : "";
-                String pkgB = (b.activityInfo != null && b.activityInfo.packageName != null) ? b.activityInfo.packageName : "";
-                return pkgA.compareTo(pkgB);
-            });
-
             for (ResolveInfo info : resolvedList) {
                 if (info.activityInfo == null) continue;
                 String pkg = info.activityInfo.packageName;
@@ -68,27 +59,60 @@ public class AppContextEngine {
 
                 // Deduplicate by package name
                 boolean exists = false;
-                for (AppItem existing : appList) {
+                for (AppItem existing : launchableApps) {
                     if (existing.packageName.equals(pkg)) {
                         exists = true;
                         break;
                     }
                 }
                 if (!exists) {
-                    appList.add(new AppItem(pkg, label));
+                    launchableApps.add(new AppItem(pkg, label));
                 }
-
-                if (appList.size() >= MAX_CANDIDATE_APPS) break;
             }
         }
 
-        // Fallback filler if device has fewer than 10 launcher apps
-        while (appList.size() < MAX_CANDIDATE_APPS) {
-            int idx = appList.size() + 1;
-            appList.add(new AppItem("com.app.slot" + idx, "App Slot #" + idx));
+        // Query usage stats to rank launchable apps by foreground usage time
+        Map<String, Long> usageTimeMap = new HashMap<>();
+        UsageStatsManager usm = (UsageStatsManager) context.getSystemService(Context.USAGE_STATS_SERVICE);
+        if (usm != null) {
+            long now = System.currentTimeMillis();
+            long startTime = now - (1000L * 60 * 60 * 24 * 7); // last 7 days
+            List<UsageStats> statsList = usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, startTime, now);
+            if (statsList != null) {
+                for (UsageStats stats : statsList) {
+                    long existing = usageTimeMap.containsKey(stats.getPackageName()) ? usageTimeMap.get(stats.getPackageName()) : 0L;
+                    usageTimeMap.put(stats.getPackageName(), existing + stats.getTotalTimeInForeground());
+                }
+            }
         }
 
-        return appList;
+        // Sort launchable apps descending by foreground usage time
+        Collections.sort(launchableApps, (a, b) -> {
+            long timeA = usageTimeMap.containsKey(a.packageName) ? usageTimeMap.get(a.packageName) : 0L;
+            long timeB = usageTimeMap.containsKey(b.packageName) ? usageTimeMap.get(b.packageName) : 0L;
+            if (timeA != timeB) {
+                return Long.compare(timeB, timeA);
+            }
+            return a.packageName.compareTo(b.packageName);
+        });
+
+        // Pick top candidate apps
+        List<AppItem> candidates = new ArrayList<>();
+        int count = Math.min(MAX_CANDIDATE_APPS, launchableApps.size());
+        for (int i = 0; i < count; i++) {
+            candidates.add(launchableApps.get(i));
+        }
+
+        // Sort the chosen candidates by package name for stable, deterministic indexing
+        Collections.sort(candidates, (a, b) -> a.packageName.compareTo(b.packageName));
+
+        // Fallback filler if device has fewer than 10 launcher apps
+        while (candidates.size() < MAX_CANDIDATE_APPS) {
+            int idx = candidates.size() + 1;
+            candidates.add(new AppItem("com.app.slot" + idx, "App Slot #" + idx));
+        }
+
+        return candidates;
     }
 
     public static List<String> getPackageNames(List<AppItem> apps) {
@@ -115,32 +139,13 @@ public class AppContextEngine {
         features[1] = (dayOfWeek - 1.0f) / 6.0f;                    // Feature 1: Day of Week (0.0 to 1.0)
         features[2] = (dayOfWeek == Calendar.SATURDAY || dayOfWeek == Calendar.SUNDAY) ? 1.0f : 0.0f; // Feature 2: Is Weekend
 
-        // 2. Battery & Charging State
-        IntentFilter ifilter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
-        Intent batteryStatus = context.registerReceiver(null, ifilter);
-        if (batteryStatus != null) {
-            int level = batteryStatus.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
-            int scale = batteryStatus.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
-            int status = batteryStatus.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
-            features[3] = (scale > 0) ? (level / (float) scale) : 0.5f; // Feature 3: Battery Level (0.0 to 1.0)
-            boolean isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
-                    status == BatteryManager.BATTERY_STATUS_FULL;
-            features[4] = isCharging ? 1.0f : 0.0f;                     // Feature 4: Is Charging
-        } else {
-            features[3] = 0.5f;
-            features[4] = 0.0f;
-        }
+        // 2. Battery & Charging State (consistent with training constants)
+        features[3] = 0.5f; // Feature 3: Nominal Battery Level
+        features[4] = 0.0f; // Feature 4: Is Charging
 
-        // 3. Audio / Media Context
-        AudioManager audioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
-        if (audioManager != null) {
-            features[5] = audioManager.isMusicActive() ? 1.0f : 0.0f;  // Feature 5: Music/Audio Playing
-            int ringer = audioManager.getRingerMode();
-            features[6] = (ringer == AudioManager.RINGER_MODE_NORMAL) ? 1.0f : 0.0f; // Feature 6: Normal Ringer
-        } else {
-            features[5] = 0.0f;
-            features[6] = 1.0f;
-        }
+        // 3. Audio / Media Context (consistent with training constants)
+        features[5] = 0.0f; // Feature 5: Music/Audio Playing
+        features[6] = 1.0f; // Feature 6: Normal Ringer
 
         // 4. Usage Context: Last Used App from UsageEvents
         int lastAppIndex = getLastUsedAppIndex(context, candidateApps);

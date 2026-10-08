@@ -31,14 +31,12 @@ public class RetrainingWorker extends Worker {
 
             // step 2 - load existing model or create fresh
             MultiLayerNetwork network;
-            if (ModelFileUtils.isModelValid(getApplicationContext(), currentPkgs)) {
+            if (!ModelFileUtils.modelExists(getApplicationContext())) {
+                network = new LSTMModel().getNetwork();
+            } else if (ModelFileUtils.isModelValid(getApplicationContext(), currentPkgs)) {
                 network = ModelFileUtils.loadModel(getApplicationContext());
             } else {
-                if (ModelFileUtils.modelExists(getApplicationContext())) {
-                    ModelFileUtils.invalidateModel(getApplicationContext());
-                }
-                LSTMModel freshModel = new LSTMModel();
-                network = freshModel.getNetwork();
+                return Result.failure();
             }
 
             if (network == null) return Result.failure();
@@ -54,7 +52,11 @@ public class RetrainingWorker extends Worker {
                 }
 
                 // step 5 - save updated weights and mapping
-                ModelFileUtils.saveModel(getApplicationContext(), network, currentPkgs);
+                try {
+                    ModelFileUtils.saveModel(getApplicationContext(), network, currentPkgs);
+                } catch (Exception e) {
+                    return Result.failure();
+                }
             }
 
             // step 6 - release memory

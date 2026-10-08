@@ -31,34 +31,43 @@ public class ModelFileUtils {
     }
 
     // save model weights and package mapping to internal storage
-    public static void saveModel(Context context, MultiLayerNetwork network, List<String> packageNames) {
+    public static void saveModel(Context context, MultiLayerNetwork network, List<String> packageNames) throws IOException {
         synchronized (MODEL_LOCK) {
-            try {
-                File modelFile = getModelFile(context);
-                ModelSerializer.writeModel(network, modelFile, true);
+            File modelFile = getModelFile(context);
+            File tmpModel = new File(context.getFilesDir(), MODEL_FILENAME + ".tmp");
+            ModelSerializer.writeModel(network, tmpModel, true);
+            if (modelFile.exists()) {
+                modelFile.delete();
+            }
+            if (!tmpModel.renameTo(modelFile)) {
+                tmpModel.delete();
+                throw new IOException("Failed to commit model file via atomic rename");
+            }
 
-                if (packageNames != null) {
-                    savePackageMapping(context, packageNames);
-                }
-            } catch (IOException e) {
-                e.printStackTrace();
+            if (packageNames != null) {
+                savePackageMapping(context, packageNames);
             }
         }
     }
 
     // save package mapping list as JSON array
-    private static void savePackageMapping(Context context, List<String> packageNames) {
-        try {
-            JSONArray array = new JSONArray();
-            for (String pkg : packageNames) {
-                array.put(pkg);
-            }
-            File mappingFile = getMappingFile(context);
-            try (FileOutputStream fos = new FileOutputStream(mappingFile)) {
-                fos.write(array.toString().getBytes(StandardCharsets.UTF_8));
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
+    private static void savePackageMapping(Context context, List<String> packageNames) throws IOException {
+        JSONArray array = new JSONArray();
+        for (String pkg : packageNames) {
+            array.put(pkg);
+        }
+        File mappingFile = getMappingFile(context);
+        File tmpMapping = new File(context.getFilesDir(), MAPPING_FILENAME + ".tmp");
+        try (FileOutputStream fos = new FileOutputStream(tmpMapping)) {
+            fos.write(array.toString().getBytes(StandardCharsets.UTF_8));
+            fos.flush();
+        }
+        if (mappingFile.exists()) {
+            mappingFile.delete();
+        }
+        if (!tmpMapping.renameTo(mappingFile)) {
+            tmpMapping.delete();
+            throw new IOException("Failed to commit package mapping file via atomic rename");
         }
     }
 

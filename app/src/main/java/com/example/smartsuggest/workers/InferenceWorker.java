@@ -49,14 +49,12 @@ public class InferenceWorker extends Worker {
             List<String> currentPkgs = AppContextEngine.getPackageNames(installedApps);
 
             // step 3 - load model (from file if valid, else fresh)
-            if (ModelFileUtils.isModelValid(getApplicationContext(), currentPkgs)) {
+            if (!ModelFileUtils.modelExists(getApplicationContext())) {
+                network = new LSTMModel().getNetwork();
+            } else if (ModelFileUtils.isModelValid(getApplicationContext(), currentPkgs)) {
                 network = ModelFileUtils.loadModel(getApplicationContext());
             } else {
-                if (ModelFileUtils.modelExists(getApplicationContext())) {
-                    ModelFileUtils.invalidateModel(getApplicationContext());
-                }
-                LSTMModel freshModel = new LSTMModel();
-                network = freshModel.getNetwork();
+                return Result.failure();
             }
 
             if (network == null) return Result.failure();

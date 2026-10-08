@@ -148,14 +148,16 @@ public class MainActivity extends AppCompatActivity {
                     List<String> currentPkgs = AppContextEngine.getPackageNames(installedApps);
 
                     // 2. Load or initialize neural network
-                    if (ModelFileUtils.isModelValid(getApplicationContext(), currentPkgs)) {
+                    if (!ModelFileUtils.modelExists(getApplicationContext())) {
+                        network = new LSTMModel().getNetwork();
+                    } else if (ModelFileUtils.isModelValid(getApplicationContext(), currentPkgs)) {
                         network = ModelFileUtils.loadModel(getApplicationContext());
                     } else {
-                        if (ModelFileUtils.modelExists(getApplicationContext())) {
-                            ModelFileUtils.invalidateModel(getApplicationContext());
-                        }
-                        LSTMModel freshModel = new LSTMModel();
-                        network = freshModel.getNetwork();
+                        runOnUiThread(() -> {
+                            resultText.setText("❌ Error: Saved model does not match current candidate apps. Please retrain.");
+                            setButtonsEnabled(true);
+                        });
+                        return;
                     }
 
                     if (network == null) {
@@ -246,14 +248,12 @@ public class MainActivity extends AppCompatActivity {
                     List<String> currentPkgs = AppContextEngine.getPackageNames(installedApps);
 
                     MultiLayerNetwork network;
-                    if (ModelFileUtils.isModelValid(getApplicationContext(), currentPkgs)) {
+                    if (!ModelFileUtils.modelExists(getApplicationContext())) {
+                        network = new LSTMModel().getNetwork();
+                    } else if (ModelFileUtils.isModelValid(getApplicationContext(), currentPkgs)) {
                         network = ModelFileUtils.loadModel(getApplicationContext());
                     } else {
-                        if (ModelFileUtils.modelExists(getApplicationContext())) {
-                            ModelFileUtils.invalidateModel(getApplicationContext());
-                        }
-                        LSTMModel freshModel = new LSTMModel();
-                        network = freshModel.getNetwork();
+                        network = new LSTMModel().getNetwork();
                     }
 
                     if (network == null) {
