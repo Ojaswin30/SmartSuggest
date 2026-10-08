@@ -36,9 +36,6 @@ public class ModelFileUtils {
             File modelFile = getModelFile(context);
             File tmpModel = new File(context.getFilesDir(), MODEL_FILENAME + ".tmp");
             ModelSerializer.writeModel(network, tmpModel, true);
-            if (modelFile.exists()) {
-                modelFile.delete();
-            }
             if (!tmpModel.renameTo(modelFile)) {
                 tmpModel.delete();
                 throw new IOException("Failed to commit model file via atomic rename");
@@ -61,9 +58,6 @@ public class ModelFileUtils {
         try (FileOutputStream fos = new FileOutputStream(tmpMapping)) {
             fos.write(array.toString().getBytes(StandardCharsets.UTF_8));
             fos.flush();
-        }
-        if (mappingFile.exists()) {
-            mappingFile.delete();
         }
         if (!tmpMapping.renameTo(mappingFile)) {
             tmpMapping.delete();
