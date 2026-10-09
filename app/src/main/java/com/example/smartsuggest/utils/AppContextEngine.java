@@ -19,15 +19,29 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * Engine responsible for extracting real-time device context, ranking and discovering
+ * installed candidate apps using foreground usage stats, and preparing sequence datasets
+ * for LSTM model training and inference.
+ */
 public class AppContextEngine {
 
     public static final int MAX_CANDIDATE_APPS = 10;
     public static final int FEATURE_COUNT = 10;
 
+    /**
+     * Data representation of an installed application candidate.
+     */
     public static class AppItem {
         public final String packageName;
         public final String label;
 
+        /**
+         * Constructs an AppItem with package name and human-readable label.
+         *
+         * @param packageName Application unique package name.
+         * @param label Human-readable application display name.
+         */
         public AppItem(String packageName, String label) {
             this.packageName = packageName;
             this.label = label;
@@ -39,6 +53,14 @@ public class AppContextEngine {
         }
     }
 
+    /**
+     * Discovers installed candidate launcher apps on the device, ranking them by actual
+     * foreground usage time and recency over the past 7 days, prioritizing user-installed
+     * interactive applications over unused system packages.
+     *
+     * @param context Application context used to query PackageManager and UsageStatsManager.
+     * @return Deterministically ordered list of top candidate {@link AppItem} instances.
+     */
     public static List<AppItem> getInstalledCandidateApps(Context context) {
         PackageManager pm = context.getPackageManager();
         Intent mainIntent = new Intent(Intent.ACTION_MAIN, null);
@@ -46,6 +68,7 @@ public class AppContextEngine {
 
         List<ResolveInfo> resolvedList = pm.queryIntentActivities(mainIntent, 0);
         List<AppItem> launchableApps = new ArrayList<>();
+        Map<String, Boolean> isSystemAppMap = new HashMap<>();
         String myPkg = context.getPackageName();
 
         if (resolvedList != null) {
@@ -67,43 +90,92 @@ public class AppContextEngine {
                 }
                 if (!exists) {
                     launchableApps.add(new AppItem(pkg, label));
+                    boolean isSys = (info.activityInfo.applicationInfo != null) &&
+                            ((info.activityInfo.applicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0);
+                    isSystemAppMap.put(pkg, isSys);
                 }
             }
         }
 
         // Query usage stats to rank launchable apps by foreground usage time
         Map<String, Long> usageTimeMap = new HashMap<>();
+        Map<String, Long> lastUsedMap = new HashMap<>();
         UsageStatsManager usm = (UsageStatsManager) context.getSystemService(Context.USAGE_STATS_SERVICE);
         if (usm != null) {
             long now = System.currentTimeMillis();
             long startTime = now - (1000L * 60 * 60 * 24 * 7); // last 7 days
-            List<UsageStats> statsList = usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, startTime, now);
-            if (statsList != null) {
-                for (UsageStats stats : statsList) {
-                    long existing = usageTimeMap.containsKey(stats.getPackageName()) ? usageTimeMap.get(stats.getPackageName()) : 0L;
-                    usageTimeMap.put(stats.getPackageName(), existing + stats.getTotalTimeInForeground());
+            Map<String, UsageStats> aggregatedStats = usm.queryAndAggregateUsageStats(startTime, now);
+            if (aggregatedStats != null && !aggregatedStats.isEmpty()) {
+                for (Map.Entry<String, UsageStats> entry : aggregatedStats.entrySet()) {
+                    UsageStats stats = entry.getValue();
+                    if (stats != null) {
+                        usageTimeMap.put(entry.getKey(), stats.getTotalTimeInForeground());
+                        lastUsedMap.put(entry.getKey(), stats.getLastTimeUsed());
+                    }
+                }
+            } else {
+                // Fallback to queryUsageStats if queryAndAggregateUsageStats is empty
+                List<UsageStats> statsList = usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, startTime, now);
+                if (statsList != null) {
+                    for (UsageStats stats : statsList) {
+                        long existing = usageTimeMap.containsKey(stats.getPackageName()) ? usageTimeMap.get(stats.getPackageName()) : 0L;
+                        usageTimeMap.put(stats.getPackageName(), existing + stats.getTotalTimeInForeground());
+                        long last = lastUsedMap.containsKey(stats.getPackageName()) ? lastUsedMap.get(stats.getPackageName()) : 0L;
+                        if (stats.getLastTimeUsed() > last) {
+                            lastUsedMap.put(stats.getPackageName(), stats.getLastTimeUsed());
+                        }
+                    }
                 }
             }
         }
 
-        // Sort launchable apps descending by foreground usage time
-        Collections.sort(launchableApps, (a, b) -> {
+        // Separate apps with real foreground activity (> 0 ms) from unused/background apps
+        List<AppItem> activeForegroundApps = new ArrayList<>();
+        List<AppItem> otherApps = new ArrayList<>();
+
+        for (AppItem app : launchableApps) {
+            long fgTime = usageTimeMap.containsKey(app.packageName) ? usageTimeMap.get(app.packageName) : 0L;
+            if (fgTime > 0) {
+                activeForegroundApps.add(app);
+            } else {
+                otherApps.add(app);
+            }
+        }
+
+        // Sort active foreground apps descending by total foreground time, then last time used
+        Collections.sort(activeForegroundApps, (a, b) -> {
             long timeA = usageTimeMap.containsKey(a.packageName) ? usageTimeMap.get(a.packageName) : 0L;
             long timeB = usageTimeMap.containsKey(b.packageName) ? usageTimeMap.get(b.packageName) : 0L;
             if (timeA != timeB) {
                 return Long.compare(timeB, timeA);
             }
-            return a.packageName.compareTo(b.packageName);
+            long lastA = lastUsedMap.containsKey(a.packageName) ? lastUsedMap.get(a.packageName) : 0L;
+            long lastB = lastUsedMap.containsKey(b.packageName) ? lastUsedMap.get(b.packageName) : 0L;
+            return Long.compare(lastB, lastA);
         });
 
-        // Pick top candidate apps
+        // Sort other launchable apps (non-system user apps prioritized over system apps)
+        Collections.sort(otherApps, (a, b) -> {
+            boolean sysA = isSystemAppMap.containsKey(a.packageName) && Boolean.TRUE.equals(isSystemAppMap.get(a.packageName));
+            boolean sysB = isSystemAppMap.containsKey(b.packageName) && Boolean.TRUE.equals(isSystemAppMap.get(b.packageName));
+            if (sysA != sysB) {
+                return sysA ? 1 : -1; // user-installed apps first
+            }
+            return a.label.compareToIgnoreCase(b.label);
+        });
+
+        // Pick top candidate apps prioritizing active foreground apps first
         List<AppItem> candidates = new ArrayList<>();
-        int count = Math.min(MAX_CANDIDATE_APPS, launchableApps.size());
-        for (int i = 0; i < count; i++) {
-            candidates.add(launchableApps.get(i));
+        for (AppItem app : activeForegroundApps) {
+            if (candidates.size() >= MAX_CANDIDATE_APPS) break;
+            candidates.add(app);
+        }
+        for (AppItem app : otherApps) {
+            if (candidates.size() >= MAX_CANDIDATE_APPS) break;
+            candidates.add(app);
         }
 
-        // Sort the chosen candidates by package name for stable, deterministic indexing
+        // Sort the chosen candidates by package name for stable, deterministic indexing in model
         Collections.sort(candidates, (a, b) -> a.packageName.compareTo(b.packageName));
 
         // Fallback filler if device has fewer than 10 launcher apps
@@ -115,6 +187,12 @@ public class AppContextEngine {
         return candidates;
     }
 
+    /**
+     * Extracts a list of package name strings from a list of {@link AppItem} instances.
+     *
+     * @param apps List of AppItem objects.
+     * @return List containing package names as strings.
+     */
     public static List<String> getPackageNames(List<AppItem> apps) {
         List<String> names = new ArrayList<>(apps.size());
         for (AppItem app : apps) {
@@ -125,6 +203,10 @@ public class AppContextEngine {
 
     /**
      * Extracts real-time device context features into a 3D INDArray for LSTM input [1, 10, 1].
+     *
+     * @param context Application context used to query system services.
+     * @param candidateApps List of candidate apps for target indexing.
+     * @return 3D INDArray representing context tensor [batch=1, features=10, timesteps=1].
      */
     public static INDArray extractCurrentContextFeatures(Context context, List<AppItem> candidateApps) {
         float[] features = new float[FEATURE_COUNT];
@@ -163,6 +245,11 @@ public class AppContextEngine {
 
     /**
      * Reads recent UsageEvents to identify the index of the last active candidate app.
+     * Ignores our own app so the previous foreground app is correctly identified.
+     *
+     * @param context Application context used to query UsageStatsManager.
+     * @param candidateApps List of candidate apps to search against.
+     * @return Index of the last active candidate app in the candidate list, or -1 if none found.
      */
     private static int getLastUsedAppIndex(Context context, List<AppItem> candidateApps) {
         UsageStatsManager usm = (UsageStatsManager) context.getSystemService(Context.USAGE_STATS_SERVICE);
@@ -176,11 +263,16 @@ public class AppContextEngine {
 
         UsageEvents.Event event = new UsageEvents.Event();
         String lastPkg = null;
+        String myPkg = context.getPackageName();
 
         while (events.hasNextEvent()) {
             events.getNextEvent(event);
             if (event.getEventType() == UsageEvents.Event.ACTIVITY_RESUMED) {
-                lastPkg = event.getPackageName();
+                String pkg = event.getPackageName();
+                // Exclude our own app from being recognized as the previous app
+                if (pkg != null && !pkg.equals(myPkg)) {
+                    lastPkg = pkg;
+                }
             }
         }
 
@@ -197,6 +289,10 @@ public class AppContextEngine {
     /**
      * Extracts actual app launch transitions from UsageStatsManager over the last 24-48h
      * and constructs a valid training DataSet for on-device LSTM fine-tuning.
+     *
+     * @param context Application context used to query UsageStatsManager.
+     * @param candidateApps List of candidate apps mapped to output classes.
+     * @return {@link DataSet} containing sequences of input context features and one-hot labels, or null if insufficient data.
      */
     public static DataSet buildTrainingDataSet(Context context, List<AppItem> candidateApps) {
         UsageStatsManager usm = (UsageStatsManager) context.getSystemService(Context.USAGE_STATS_SERVICE);
@@ -212,17 +308,23 @@ public class AppContextEngine {
 
         List<Integer> targetIndices = new ArrayList<>();
         List<Long> eventTimestamps = new ArrayList<>();
+        String myPkg = context.getPackageName();
 
         UsageEvents events = usm.queryEvents(startTime, endTime);
         if (events != null) {
             UsageEvents.Event event = new UsageEvents.Event();
+            String prevPkg = null;
             while (events.hasNextEvent()) {
                 events.getNextEvent(event);
                 if (event.getEventType() == UsageEvents.Event.ACTIVITY_RESUMED) {
                     String pkg = event.getPackageName();
-                    if (pkgToIndex.containsKey(pkg)) {
-                        targetIndices.add(pkgToIndex.get(pkg));
-                        eventTimestamps.add(event.getTimeStamp());
+                    if (pkg != null && !pkg.equals(myPkg) && pkgToIndex.containsKey(pkg)) {
+                        // Avoid consecutive duplicate activity resumes of the exact same app
+                        if (!pkg.equals(prevPkg)) {
+                            targetIndices.add(pkgToIndex.get(pkg));
+                            eventTimestamps.add(event.getTimeStamp());
+                            prevPkg = pkg;
+                        }
                     }
                 }
             }
