@@ -19,15 +19,29 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * Engine responsible for extracting real-time device context, ranking and discovering
+ * installed candidate apps using foreground usage stats, and preparing sequence datasets
+ * for LSTM model training and inference.
+ */
 public class AppContextEngine {
 
     public static final int MAX_CANDIDATE_APPS = 10;
     public static final int FEATURE_COUNT = 10;
 
+    /**
+     * Data representation of an installed application candidate.
+     */
     public static class AppItem {
         public final String packageName;
         public final String label;
 
+        /**
+         * Constructs an AppItem with package name and human-readable label.
+         *
+         * @param packageName Application unique package name.
+         * @param label Human-readable application display name.
+         */
         public AppItem(String packageName, String label) {
             this.packageName = packageName;
             this.label = label;
@@ -39,6 +53,14 @@ public class AppContextEngine {
         }
     }
 
+    /**
+     * Discovers installed candidate launcher apps on the device, ranking them by actual
+     * foreground usage time and recency over the past 7 days, prioritizing user-installed
+     * interactive applications over unused system packages.
+     *
+     * @param context Application context used to query PackageManager and UsageStatsManager.
+     * @return Deterministically ordered list of top candidate {@link AppItem} instances.
+     */
     public static List<AppItem> getInstalledCandidateApps(Context context) {
         PackageManager pm = context.getPackageManager();
         Intent mainIntent = new Intent(Intent.ACTION_MAIN, null);
@@ -165,6 +187,12 @@ public class AppContextEngine {
         return candidates;
     }
 
+    /**
+     * Extracts a list of package name strings from a list of {@link AppItem} instances.
+     *
+     * @param apps List of AppItem objects.
+     * @return List containing package names as strings.
+     */
     public static List<String> getPackageNames(List<AppItem> apps) {
         List<String> names = new ArrayList<>(apps.size());
         for (AppItem app : apps) {
@@ -175,6 +203,10 @@ public class AppContextEngine {
 
     /**
      * Extracts real-time device context features into a 3D INDArray for LSTM input [1, 10, 1].
+     *
+     * @param context Application context used to query system services.
+     * @param candidateApps List of candidate apps for target indexing.
+     * @return 3D INDArray representing context tensor [batch=1, features=10, timesteps=1].
      */
     public static INDArray extractCurrentContextFeatures(Context context, List<AppItem> candidateApps) {
         float[] features = new float[FEATURE_COUNT];
@@ -214,6 +246,10 @@ public class AppContextEngine {
     /**
      * Reads recent UsageEvents to identify the index of the last active candidate app.
      * Ignores our own app so the previous foreground app is correctly identified.
+     *
+     * @param context Application context used to query UsageStatsManager.
+     * @param candidateApps List of candidate apps to search against.
+     * @return Index of the last active candidate app in the candidate list, or -1 if none found.
      */
     private static int getLastUsedAppIndex(Context context, List<AppItem> candidateApps) {
         UsageStatsManager usm = (UsageStatsManager) context.getSystemService(Context.USAGE_STATS_SERVICE);
@@ -253,6 +289,10 @@ public class AppContextEngine {
     /**
      * Extracts actual app launch transitions from UsageStatsManager over the last 24-48h
      * and constructs a valid training DataSet for on-device LSTM fine-tuning.
+     *
+     * @param context Application context used to query UsageStatsManager.
+     * @param candidateApps List of candidate apps mapped to output classes.
+     * @return {@link DataSet} containing sequences of input context features and one-hot labels, or null if insufficient data.
      */
     public static DataSet buildTrainingDataSet(Context context, List<AppItem> candidateApps) {
         UsageStatsManager usm = (UsageStatsManager) context.getSystemService(Context.USAGE_STATS_SERVICE);
